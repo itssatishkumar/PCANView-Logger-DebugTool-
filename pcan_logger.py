@@ -635,8 +635,9 @@ class PCANViewClone(QMainWindow):
 
 if __name__ == "__main__":
     LOCAL_VERSION = "1.0.0"  # keep in sync with your app version
-    updater.check_for_update(LOCAL_VERSION)
-    app = QApplication(sys.argv)
+    app = QApplication(sys.argv)  # Create QApplication first
+    updater.check_for_update(LOCAL_VERSION, app)  # Pass app instance here
     window = PCANViewClone()
     window.show()
     sys.exit(app.exec())
+
