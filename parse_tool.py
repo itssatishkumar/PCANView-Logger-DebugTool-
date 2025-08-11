@@ -1,13 +1,12 @@
-# parse_tool.py
 import os
 import re
 import math
 import cantools
 import pandas as pd
 import csv
-from tkinter import filedialog, Tk
-from tqdm import tqdm
 from collections import OrderedDict
+from tqdm import tqdm
+from tkinter import Tk, filedialog
 
 # ---------------------- TRC MERGE & INFO EXTRACTION ---------------------- #
 def extract_trc_info(filepath):
@@ -195,62 +194,40 @@ def write_large_csv(df, base_path):
     return paths
 
 
-def trc_to_csv():
-    print("📂 Select one or more .trc files")
-    trc_files = filedialog.askopenfilenames(filetypes=[("TRC files", "*.trc")])
-    if not trc_files:
-        print("❌ No TRC files selected.")
-        return
-
+# ---------------------- REFACTORED TRC TO CSV ---------------------- #
+def trc_to_csv(trc_files, dbc_file, output_base_path):
+    """
+    trc_files: list of paths to TRC files
+    dbc_file: path to dbc file
+    output_base_path: base path (without extension) for saving CSV output
+    """
     try:
         merged_path = merge_in_forced_order(trc_files)
     except Exception as e:
         print(f"❌ Merge failed: {e}")
-        return
-
-    print("\n📁 Please select the .dbc file")
-    dbc_file = filedialog.askopenfilename(filetypes=[("DBC files", "*.dbc")])
-    if not dbc_file:
-        print("❌ No DBC file selected.")
-        return
+        return False
 
     try:
         dbc = cantools.database.load_file(dbc_file)
     except Exception as e:
         print(f"❌ Failed to load DBC: {e}")
-        return
+        return False
 
     print("\n🔍 Decoding merged TRC file...")
     rows, columns = parse_trc_file(merged_path, dbc)
 
     if not rows:
         print("❌ No data decoded.")
-        return
+        return False
 
     df = pd.DataFrame(rows)
     df = df.reindex(columns=columns)
 
-    base_path = os.path.splitext(merged_path)[0] + "_decoded"
-    write_large_csv(df, base_path)
+    write_large_csv(df, output_base_path)
+    return True
 
 
 # ---------------------- LOG PARSING ---------------------- #
-def select_file(title, filetypes):
-    root = Tk()
-    root.withdraw()
-    path = filedialog.askopenfilename(title=title, filetypes=filetypes)
-    root.destroy()
-    return path
-
-
-def save_file(title, defaultextension=".csv", filetypes=[("CSV files", "*.csv")]):
-    root = Tk()
-    root.withdraw()
-    path = filedialog.asksaveasfilename(title=title, defaultextension=defaultextension, filetypes=filetypes)
-    root.destroy()
-    return path
-
-
 def parse_log_to_compact_csv(log_path, dbc_path, output_csv_path):
     db = cantools.database.load_file(dbc_path)
     message_map = {msg.frame_id: msg for msg in db.messages}
@@ -299,10 +276,33 @@ def parse_log_to_compact_csv(log_path, dbc_path, output_csv_path):
     print(f"✅ Final snapshot CSV written to {output_csv_path}")
 
 
-if __name__ == "__main__":
-    log_file = select_file("Select your .log file", [("Log Files", "*.log")])
-    dbc_file = select_file("Select your .dbc file", [("DBC Files", "*.dbc")])
-    csv_output = save_file("Save Clean CSV Output")
+# ---------------------- MAIN (with multi-select) ---------------------- #
+def main():
+    Tk().withdraw()  # Hide Tkinter root window
 
-    if log_file and dbc_file and csv_output:
-        parse_log_to_compact_csv(log_file, dbc_file, csv_output)
+    print("📂 Please select one or more TRC files")
+    trc_files = filedialog.askopenfilenames(title="Select TRC files", filetypes=[("TRC files", "*.trc")])
+    if not trc_files:
+        print("❌ No TRC files selected.")
+        return
+
+    print("\n📁 Please select the DBC file")
+    dbc_file = filedialog.askopenfilename(title="Select DBC file", filetypes=[("DBC files", "*.dbc")])
+    if not dbc_file:
+        print("❌ No DBC file selected.")
+        return
+
+    # Output base path for CSVs (same dir as first TRC, with suffix)
+    base_dir = os.path.dirname(trc_files[0])
+    base_name = os.path.splitext(os.path.basename(trc_files[0]))[0]
+    output_base_path = os.path.join(base_dir, base_name + "_decoded")
+
+    success = trc_to_csv(trc_files, dbc_file, output_base_path)
+    if success:
+        print("\n✅ TRC to CSV conversion completed successfully.")
+    else:
+        print("\n❌ TRC to CSV conversion failed.")
+
+
+if __name__ == "__main__":
+    main()
