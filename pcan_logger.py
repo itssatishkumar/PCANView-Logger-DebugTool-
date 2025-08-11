@@ -362,7 +362,6 @@ class PCANViewClone(QMainWindow):
         self.transmit_table.setItem(row, 3, QTableWidgetItem(str(data["length"])))
         self.transmit_table.setItem(row, 4, QTableWidgetItem(databytes))
         self.transmit_table.setItem(row, 5, QTableWidgetItem(data["cycle"]))
-        # Fix: Ensure Count cell exists as QTableWidgetItem with initial "0"
         self.transmit_table.setItem(row, 6, QTableWidgetItem("0"))
         self.transmit_table.setItem(row, 7, QTableWidgetItem(data["comment"]))
 
@@ -389,61 +388,85 @@ class PCANViewClone(QMainWindow):
             self.handle_disconnect()
 
     def handle_disconnect(self):
-        if self.worker:
+        if self.worker and self.worker.isRunning():
             self.worker.running = False
             self.worker.wait()
         self.pcan.Uninitialize(CAN_CHANNEL)
         self.is_connected = False
         self.connect_btn.setText("Connect")
         self.status_conn.setText("Disconnected")
-        self.status_conn.setStyleSheet("color: red;")
-        self.status_bus.setText("Status: ---")
+        self.status_conn.setStyleSheet("color: black;")
+        self.status_bitrate.setText("Bit rate: ---")
 
     def process_message(self, msg, ts_us):
-        can_id = f"{msg.ID:04X}"
-        data = ' '.join(f"{b:02X}" for b in msg.DATA[:msg.LEN])
-        # --- Update Rx table ---
-        if can_id in self.live_data:
-            row, count, last_ts = self.live_data[can_id]
-            cycle_time = (ts_us - last_ts) / 1000.0
-            count += 1
-            self.receive_table.setItem(row, 1, QTableWidgetItem(str(count)))
-            self.receive_table.setItem(row, 2, QTableWidgetItem(f"{cycle_time:.2f}"))
-            self.receive_table.setItem(row, 3, QTableWidgetItem(data))
-            self.live_data[can_id] = (row, count, ts_us)
-        else:
+        can_id = msg.ID
+        length = msg.LEN
+        data = ' '.join(f"{b:02X}" for b in msg.DATA[:length])
+
+        # Update live data dictionary for counts & cycle time
+        if can_id not in self.live_data:
+            self.live_data[can_id] = {"count": 0, "last_ts": ts_us, "cycle_time": 0, "data": data}
+            # Add new row
             row = self.receive_table.rowCount()
             self.receive_table.insertRow(row)
-            self.receive_table.setItem(row, 0, QTableWidgetItem(can_id))
+            self.receive_table.setItem(row, 0, QTableWidgetItem(f"{can_id:03X}"))
             self.receive_table.setItem(row, 1, QTableWidgetItem("1"))
-            self.receive_table.setItem(row, 2, QTableWidgetItem("0.00"))
+            self.receive_table.setItem(row, 2, QTableWidgetItem("0"))
             self.receive_table.setItem(row, 3, QTableWidgetItem(data))
-            self.live_data[can_id] = (row, 1, ts_us)
+        else:
+            old = self.live_data[can_id]
+            cycle = (ts_us - old["last_ts"]) / 1000.0
+            if cycle < 0:
+                cycle = 0
+            old["count"] += 1
+            old["last_ts"] = ts_us
+            old["cycle_time"] = cycle
+            old["data"] = data
+            # Update row in table
+            for row in range(self.receive_table.rowCount()):
+                item = self.receive_table.item(row, 0)
+                if item and item.text() == f"{can_id:03X}":
+                    self.receive_table.setItem(row, 1, QTableWidgetItem(str(old["count"])))
+                    self.receive_table.setItem(row, 2, QTableWidgetItem(f"{cycle:.1f}"))
+                    self.receive_table.setItem(row, 3, QTableWidgetItem(data))
+                    break
 
-        # --- Trace logging buffer ---
-        self.add_trace_entry(ts_us, can_id, "Rx", msg.LEN, data)
+        # Add to trace buffer & update trace table if visible
+        self.add_trace_entry(ts_us, f"{can_id:03X}", "Rx", length, data)
+
+        # Logging
         if self.logging:
-            self.message_count += 1
             offset_sec = time.time() - self.log_start_time
+            self.message_count += 1
             self.write_trc_entry(self.message_count, offset_sec, msg, tx=False)
 
+    # ----------------------------
+    # Transmit messages
+    # ----------------------------
     def auto_send_messages(self):
         if not self.is_connected:
             return
-        current_time = int(time.time() * 1000)
+        now = time.time() * 1000
         for row in range(self.transmit_table.rowCount()):
-            chk = self.transmit_table.cellWidget(row, 0)
-            if chk and chk.isChecked():
-                try:
-                    cycle_time = int(self.transmit_table.item(row, 5).text())
-                except Exception:
-                    cycle_time = 100
-                # Instead of current_time % cycle_time < 100, use elapsed time logic for better accuracy
-                last_sent_key = f"last_sent_{row}"
-                last_sent = getattr(self, last_sent_key, 0)
-                if current_time - last_sent >= cycle_time:
-                    self._send_can_row(row)
-                    setattr(self, last_sent_key, current_time)
+            enable_widget = self.transmit_table.cellWidget(row, 0)
+            if not enable_widget or not enable_widget.isChecked():
+                continue
+            cycle_str = self.transmit_table.item(row, 5).text()
+            try:
+                cycle = float(cycle_str)
+            except Exception:
+                cycle = 0
+            if cycle <= 0:
+                continue
+
+            last_sent_item = self.transmit_table.item(row, 7)  # Reuse comment col or store timestamps separately
+            # For simplicity, track last sent timestamp per row in an attribute
+            if not hasattr(self, "_last_send_times"):
+                self._last_send_times = {}
+            last_sent = self._last_send_times.get(row, 0)
+            if (time.time() * 1000 - last_sent) >= cycle:
+                self._send_can_row(row)
+                self._last_send_times[row] = time.time() * 1000
 
     def _send_can_row(self, row):
         try:
@@ -461,7 +484,6 @@ class PCANViewClone(QMainWindow):
             if result != PCAN_ERROR_OK:
                 self.status_bus.setText(f"Send Error: {result}")
             else:
-                # Update Count cell on transmit table
                 count_item = self.transmit_table.item(row, 6)
                 if count_item is None:
                     count_item = QTableWidgetItem("0")
@@ -473,13 +495,11 @@ class PCANViewClone(QMainWindow):
                 count += 1
                 count_item.setText(str(count))
 
-                # Log transmitted message if logging active
                 if self.logging:
                     self.message_count += 1
                     offset_sec = time.time() - self.log_start_time
                     self.write_trc_entry(self.message_count, offset_sec, msg, tx=True)
 
-                # Add to trace buffer
                 ts_us = int(time.time() * 1e6)
                 data = ' '.join(f"{b:02X}" for b in data_bytes)
                 self.add_trace_entry(ts_us, f"{can_id:04X}", "Tx", length, data)
@@ -544,18 +564,23 @@ class PCANViewClone(QMainWindow):
         worker.start()
 
     def convert_trc_to_csv(self):
-        trc_path, _ = QFileDialog.getOpenFileName(self, "Select TRC File", "", "TRC Files (*.trc)")
-        if not trc_path:
+        trc_paths, _ = QFileDialog.getOpenFileNames(self, "Select one or more TRC Files", "", "TRC Files (*.trc)")
+        if not trc_paths:
             QMessageBox.information(self, "No File Selected", "No TRC file selected. Conversion cancelled.")
+            return
+
+        dbc_path, _ = QFileDialog.getOpenFileName(self, "Select DBC File", "", "DBC Files (*.dbc)")
+        if not dbc_path:
+            QMessageBox.information(self, "No DBC Selected", "No DBC file selected. Conversion cancelled.")
             return
 
         output_path, _ = QFileDialog.getSaveFileName(self, "Save CSV Output", "", "CSV Files (*.csv)")
         if not output_path:
-            QMessageBox.information(self, "No File Selected", "No output CSV file selected. Conversion cancelled.")
+            QMessageBox.information(self, "No output selected", "No output CSV file selected. Conversion cancelled.")
             return
 
         def task():
-            trc_to_csv(trc_path, output_path)
+            trc_to_csv(trc_paths, dbc_path, output_path)
             return f"TRC → CSV conversion completed.\nSaved: {output_path}"
 
         self._start_background_task_with_progress(task)
@@ -568,12 +593,12 @@ class PCANViewClone(QMainWindow):
 
         dbc_path, _ = QFileDialog.getOpenFileName(self, "Select DBC File", "", "DBC Files (*.dbc)")
         if not dbc_path:
-            QMessageBox.information(self, "No File Selected", "No DBC file selected. Conversion cancelled.")
+            QMessageBox.information(self, "No DBC Selected", "No DBC file selected. Conversion cancelled.")
             return
 
         output_path, _ = QFileDialog.getSaveFileName(self, "Save CSV Output", "", "CSV Files (*.csv)")
         if not output_path:
-            QMessageBox.information(self, "No File Selected", "No output CSV file selected. Conversion cancelled.")
+            QMessageBox.information(self, "No output selected", "No output CSV file selected. Conversion cancelled.")
             return
 
         def task():
@@ -634,10 +659,9 @@ class PCANViewClone(QMainWindow):
 
 
 if __name__ == "__main__":
-    LOCAL_VERSION = "1.0.0"  # keep in sync with your app version
+    LOCAL_VERSION = "1.0.1"  # keep in sync with your app version
     app = QApplication(sys.argv)  # Create QApplication first
     updater.check_for_update(LOCAL_VERSION, app)  # Pass app instance here
     window = PCANViewClone()
     window.show()
     sys.exit(app.exec())
-
