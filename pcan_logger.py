@@ -150,6 +150,7 @@ class PCANViewClone(QMainWindow):
         self.log_start_time = None
         self.message_count = 0
         self.logging = False
+        self.current_log_filename = None  # track current filename explicitly
 
         # --- Toolbar ---
         toolbar = QToolBar("Main Toolbar")
@@ -162,6 +163,7 @@ class PCANViewClone(QMainWindow):
         toolbar.addWidget(self.connect_btn)
 
         self.log_start_btn = QPushButton("Start Logging")
+        # Always prompt for filename when starting logging
         self.log_start_btn.clicked.connect(self.ask_log_filename)
         self.style_toolbar_button(self.log_start_btn, bg="green")
         toolbar.addWidget(self.log_start_btn)
@@ -326,7 +328,17 @@ class PCANViewClone(QMainWindow):
         self.trace_tab.setLayout(layout)
 
     def switch_to_trace_tab(self):
+        # Switch view
         self.tabs.setCurrentWidget(self.trace_tab)
+        # Populate table once (so user sees recent history) but avoid repeated heavy rebuilds
+        if self.trace_table.rowCount() == 0 and self.trace_buffer:
+            # Bulk populate once when first opening
+            self.trace_table.setRowCount(len(self.trace_buffer))
+            for i, entry in enumerate(self.trace_buffer):
+                for j, val in enumerate(entry):
+                    self.trace_table.setItem(i, j, QTableWidgetItem(val))
+            # scroll to bottom
+            self.trace_table.scrollToBottom()
 
     # ----------------------------
     def style_toolbar_button(self, button, bg="#0078D7"):
@@ -431,7 +443,7 @@ class PCANViewClone(QMainWindow):
                     self.receive_table.setItem(row, 3, QTableWidgetItem(data))
                     break
 
-        # Add to trace buffer & update trace table if visible
+        # Add to trace buffer & update trace table incrementally
         self.add_trace_entry(ts_us, f"{can_id:03X}", "Rx", length, data)
 
         # Logging
@@ -507,21 +519,44 @@ class PCANViewClone(QMainWindow):
             self.status_bus.setText(f"Send Exception: {e}")
 
     # ----------------------------
-    # Trace buffer & table
+    # Trace buffer & table (incremental append style)
     # ----------------------------
     def add_trace_entry(self, ts_us, can_id, direction, length, data):
         timestamp_ms = ts_us / 1000.0
-        self.trace_buffer.append([f"{timestamp_ms:.3f}", can_id, direction, str(length), data])
+        new_entry = [f"{timestamp_ms:.3f}", can_id, direction, str(length), data]
+
+        # Append to internal buffer
+        self.trace_buffer.append(new_entry)
+
+        # If over max size, remove oldest from buffer and table (if visible)
         if len(self.trace_buffer) > self.max_trace_messages:
+            # drop oldest in buffer
             self.trace_buffer.pop(0)
+            # remove top row in visible table to keep sizes aligned
+            if self.tabs.currentWidget() == self.trace_tab and self.trace_table.rowCount() > 0:
+                try:
+                    self.trace_table.removeRow(0)
+                except Exception:
+                    pass  # defensive
+
+        # If trace tab is visible, append the new row to the table only (no full rebuild)
         if self.tabs.currentWidget() == self.trace_tab:
-            self.refresh_trace_table()
+            scrollbar = self.trace_table.verticalScrollBar()
+            at_bottom = scrollbar.value() == scrollbar.maximum()
+
+            row = self.trace_table.rowCount()
+            self.trace_table.insertRow(row)
+            for col, val in enumerate(new_entry):
+                self.trace_table.setItem(row, col, QTableWidgetItem(val))
+
+            # Auto-scroll only if user is already at bottom
+            if at_bottom:
+                self.trace_table.scrollToBottom()
 
     def refresh_trace_table(self):
-        self.trace_table.setRowCount(len(self.trace_buffer))
-        for i, entry in enumerate(self.trace_buffer):
-            for j, val in enumerate(entry):
-                self.trace_table.setItem(i, j, QTableWidgetItem(val))
+        # kept for compatibility but not used per-message to avoid freezes.
+        # We intentionally avoid rebuilding the whole table on every message.
+        pass
 
     # ----------------------------
     # Parse tool functions with fixed dialogs and progress
@@ -611,28 +646,43 @@ class PCANViewClone(QMainWindow):
     # Logging methods
     # ----------------------------
     def ask_log_filename(self):
+        # Always ask for a new filename
         filename, _ = QFileDialog.getSaveFileName(self, "Save Log File", "", "TRC Files (*.trc)")
         if filename:
+            # ensure we always create a fresh file (write mode)
             self.start_logging(filename)
 
     def start_logging(self, filename):
         try:
+            # always open in write mode so it doesn't append to an old file by mistake
+            if self.log_file:
+                try:
+                    self.log_file.close()
+                except Exception:
+                    pass
+                self.log_file = None
             self.log_file = open(filename, "w")
+            self.current_log_filename = filename
             self.log_start_time = time.time()
             self.message_count = 0
             self.write_trc_header()
             self.logging = True
             self.log_start_btn.setEnabled(False)
             self.log_stop_btn.setEnabled(True)
-            self.status_bus.setText("Logging Started")
+            self.status_bus.setText(f"Logging Started: {filename}")
         except Exception as e:
             self.status_bus.setText(f"Logging Error: {e}")
 
     def stop_logging(self):
+        # Stop logging and clear stored filename so next Start will always ask
         self.logging = False
         if self.log_file:
-            self.log_file.close()
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
             self.log_file = None
+        self.current_log_filename = None
         self.log_start_btn.setEnabled(True)
         self.log_stop_btn.setEnabled(False)
         self.status_bus.setText("Logging Stopped")
@@ -684,5 +734,3 @@ if __name__ == "__main__":
     window = PCANViewClone()
     window.show()
     sys.exit(app.exec())
-
-
