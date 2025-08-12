@@ -14,6 +14,8 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPoint
 from PCANBasic import *
 import updater  # Import updater module
 
+from filesize import LogFileHandler  # <-- ensure filesize.py is present
+
 CAN_CHANNEL = PCAN_USBBUS1
 CAN_BAUDRATE = PCAN_BAUD_250K
 
@@ -152,6 +154,17 @@ class PCANViewClone(QMainWindow):
         self.logging = False
         self.current_log_filename = None  # track current filename explicitly
 
+        # Log handler for rollover
+        self.log_handler = None
+        # For timestamp reset per log
+        self.log_start_time = None
+
+        # Track connection start for timestamps in trace
+        self.connection_start_time = None
+
+        # Flag to prevent duplicate header writes
+        self.header_written = False
+
         # --- Toolbar ---
         toolbar = QToolBar("Main Toolbar")
         toolbar.setStyleSheet("QToolBar { background-color: #0078D7; }")
@@ -266,6 +279,11 @@ class PCANViewClone(QMainWindow):
         self._worker_thread = None
         self._progress_dialog = None
 
+        # Timer for blinking status_bus text when logging
+        self._blink_timer = QTimer()
+        self._blink_timer.timeout.connect(self._blink_status_text)
+        self._blink_state = False
+
     # Helper for Parse menu actions
     def _parse_menu_action_triggered(self, text):
         if text == "TRC → CSV":
@@ -324,21 +342,18 @@ class PCANViewClone(QMainWindow):
         self.trace_table.setHorizontalHeaderLabels(["Time (ms)", "CAN ID", "Rx/Tx", "Length", "Data"])
         self.trace_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.trace_table.setAlternatingRowColors(True)
+
+        # Set trace_table to only 1 row for live flow display
+        self.trace_table.setRowCount(1)
+        # Initialize empty row cells
+        for col in range(5):
+            self.trace_table.setItem(0, col, QTableWidgetItem(""))
+
         layout.addWidget(self.trace_table)
         self.trace_tab.setLayout(layout)
 
     def switch_to_trace_tab(self):
-        # Switch view
         self.tabs.setCurrentWidget(self.trace_tab)
-        # Populate table once (so user sees recent history) but avoid repeated heavy rebuilds
-        if self.trace_table.rowCount() == 0 and self.trace_buffer:
-            # Bulk populate once when first opening
-            self.trace_table.setRowCount(len(self.trace_buffer))
-            for i, entry in enumerate(self.trace_buffer):
-                for j, val in enumerate(entry):
-                    self.trace_table.setItem(i, j, QTableWidgetItem(val))
-            # scroll to bottom
-            self.trace_table.scrollToBottom()
 
     # ----------------------------
     def style_toolbar_button(self, button, bg="#0078D7"):
@@ -393,6 +408,8 @@ class PCANViewClone(QMainWindow):
                 self.status_conn.setText("Connected to hardware PCAN-USB")
                 self.status_conn.setStyleSheet("color: green; font-weight: bold;")
                 self.status_bitrate.setText("Bit rate: 250 kbit/s")
+                # set the connection start time for trace timestamps
+                self.connection_start_time = time.time()
             else:
                 self.status_conn.setText("No device or busy")
                 self.status_conn.setStyleSheet("color: red;")
@@ -403,12 +420,17 @@ class PCANViewClone(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.running = False
             self.worker.wait()
-        self.pcan.Uninitialize(CAN_CHANNEL)
+        try:
+            self.pcan.Uninitialize(CAN_CHANNEL)
+        except Exception:
+            pass
         self.is_connected = False
         self.connect_btn.setText("Connect")
         self.status_conn.setText("Disconnected")
         self.status_conn.setStyleSheet("color: black;")
         self.status_bitrate.setText("Bit rate: ---")
+        # reset connection start time
+        self.connection_start_time = None
 
     def process_message(self, msg, ts_us):
         can_id = msg.ID
@@ -443,11 +465,24 @@ class PCANViewClone(QMainWindow):
                     self.receive_table.setItem(row, 3, QTableWidgetItem(data))
                     break
 
-        # Add to trace buffer & update trace table incrementally
-        self.add_trace_entry(ts_us, f"{can_id:03X}", "Rx", length, data)
+        # Update trace table single-row display (always update row 0)
+        # Compute friendly timestamp relative to connection start if available
+        if self.connection_start_time:
+            timestamp_ms = (time.time() - self.connection_start_time) * 1000.0
+        else:
+            timestamp_ms = ts_us / 1000.0
+
+        trace_data = [f"{timestamp_ms:.3f}", f"{can_id:04X}", "Rx", str(length), data]
+        for col, val in enumerate(trace_data):
+            self.trace_table.setItem(0, col, QTableWidgetItem(val))
+
+        # Add to trace buffer (optional, for later use)
+        self.trace_buffer.append(trace_data)
+        if len(self.trace_buffer) > self.max_trace_messages:
+            self.trace_buffer.pop(0)
 
         # Logging
-        if self.logging:
+        if self.logging and self.log_start_time:
             offset_sec = time.time() - self.log_start_time
             self.message_count += 1
             self.write_trc_entry(self.message_count, offset_sec, msg, tx=False)
@@ -458,7 +493,9 @@ class PCANViewClone(QMainWindow):
     def auto_send_messages(self):
         if not self.is_connected:
             return
-        now = time.time() * 1000
+        now_ms = time.time() * 1000
+        if not hasattr(self, "_last_send_times"):
+            self._last_send_times = {}
         for row in range(self.transmit_table.rowCount()):
             enable_widget = self.transmit_table.cellWidget(row, 0)
             if not enable_widget or not enable_widget.isChecked():
@@ -471,14 +508,10 @@ class PCANViewClone(QMainWindow):
             if cycle <= 0:
                 continue
 
-            last_sent_item = self.transmit_table.item(row, 7)  # Reuse comment col or store timestamps separately
-            # For simplicity, track last sent timestamp per row in an attribute
-            if not hasattr(self, "_last_send_times"):
-                self._last_send_times = {}
             last_sent = self._last_send_times.get(row, 0)
-            if (time.time() * 1000 - last_sent) >= cycle:
+            if (now_ms - last_sent) >= cycle:
                 self._send_can_row(row)
-                self._last_send_times[row] = time.time() * 1000
+                self._last_send_times[row] = now_ms
 
     def _send_can_row(self, row):
         try:
@@ -507,55 +540,36 @@ class PCANViewClone(QMainWindow):
                 count += 1
                 count_item.setText(str(count))
 
-                if self.logging:
-                    self.message_count += 1
+                if self.logging and self.log_start_time:
                     offset_sec = time.time() - self.log_start_time
+                    self.message_count += 1
                     self.write_trc_entry(self.message_count, offset_sec, msg, tx=True)
 
                 ts_us = int(time.time() * 1e6)
                 data = ' '.join(f"{b:02X}" for b in data_bytes)
-                self.add_trace_entry(ts_us, f"{can_id:04X}", "Tx", length, data)
+
+                # Update trace row for Tx message
+                if self.connection_start_time:
+                    timestamp_ms = (time.time() - self.connection_start_time) * 1000.0
+                else:
+                    timestamp_ms = ts_us / 1000.0
+
+                trace_data = [f"{timestamp_ms:.3f}", f"{can_id:04X}", "Tx", str(length), data]
+                for col, val in enumerate(trace_data):
+                    self.trace_table.setItem(0, col, QTableWidgetItem(val))
+
         except Exception as e:
             self.status_bus.setText(f"Send Exception: {e}")
 
     # ----------------------------
-    # Trace buffer & table (incremental append style)
+    # Trace buffer & table (incremental append style) - replaced by single line live update
     # ----------------------------
     def add_trace_entry(self, ts_us, can_id, direction, length, data):
-        timestamp_ms = ts_us / 1000.0
-        new_entry = [f"{timestamp_ms:.3f}", can_id, direction, str(length), data]
-
-        # Append to internal buffer
-        self.trace_buffer.append(new_entry)
-
-        # If over max size, remove oldest from buffer and table (if visible)
-        if len(self.trace_buffer) > self.max_trace_messages:
-            # drop oldest in buffer
-            self.trace_buffer.pop(0)
-            # remove top row in visible table to keep sizes aligned
-            if self.tabs.currentWidget() == self.trace_tab and self.trace_table.rowCount() > 0:
-                try:
-                    self.trace_table.removeRow(0)
-                except Exception:
-                    pass  # defensive
-
-        # If trace tab is visible, append the new row to the table only (no full rebuild)
-        if self.tabs.currentWidget() == self.trace_tab:
-            scrollbar = self.trace_table.verticalScrollBar()
-            at_bottom = scrollbar.value() == scrollbar.maximum()
-
-            row = self.trace_table.rowCount()
-            self.trace_table.insertRow(row)
-            for col, val in enumerate(new_entry):
-                self.trace_table.setItem(row, col, QTableWidgetItem(val))
-
-            # Auto-scroll only if user is already at bottom
-            if at_bottom:
-                self.trace_table.scrollToBottom()
+        # Disabled because trace_table now shows just one line live update
+        pass
 
     def refresh_trace_table(self):
-        # kept for compatibility but not used per-message to avoid freezes.
-        # We intentionally avoid rebuilding the whole table on every message.
+        # Not used
         pass
 
     # ----------------------------
@@ -646,55 +660,78 @@ class PCANViewClone(QMainWindow):
     # Logging methods
     # ----------------------------
     def ask_log_filename(self):
+        # Require connection before allowing logging
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not connected", "Please connect to PCAN device before starting logging.")
+            return
+
         # Always ask for a new filename
         filename, _ = QFileDialog.getSaveFileName(self, "Save Log File", "", "TRC Files (*.trc)")
         if filename:
-            # ensure we always create a fresh file (write mode)
+            # ensure we always create a fresh file (handled by LogFileHandler)
             self.start_logging(filename)
 
     def start_logging(self, filename):
         try:
-            # always open in write mode so it doesn't append to an old file by mistake
-            if self.log_file:
+            # Close any existing handler first
+            if self.log_handler:
                 try:
-                    self.log_file.close()
+                    self.log_handler.close()
                 except Exception:
                     pass
-                self.log_file = None
-            self.log_file = open(filename, "w")
+                self.log_handler = None
+
+            # Create handler — max_size_mb comes from filesize.py default
+            self.log_handler = LogFileHandler(filename)
             self.current_log_filename = filename
+
+            # reset log-relative timestamp baseline
             self.log_start_time = time.time()
             self.message_count = 0
+            self.header_written = False  # Reset header flag for new file
             self.write_trc_header()
+            self.header_written = True
+
             self.logging = True
             self.log_start_btn.setEnabled(False)
             self.log_stop_btn.setEnabled(True)
             self.status_bus.setText(f"Logging Started: {filename}")
+
+            # Start blinking timer for status_bus text
+            self._blink_state = True
+            self._blink_timer.start(500)
+
         except Exception as e:
             self.status_bus.setText(f"Logging Error: {e}")
 
     def stop_logging(self):
-        # Stop logging and clear stored filename so next Start will always ask
         self.logging = False
-        if self.log_file:
+        # Stop blinking timer and reset status_bus text color
+        self._blink_timer.stop()
+        self.status_bus.setStyleSheet("color: black;")
+        self.status_bus.setText("Logging Stopped")
+
+        if self.log_handler:
             try:
-                self.log_file.close()
+                self.log_handler.close()
             except Exception:
                 pass
-            self.log_file = None
+            self.log_handler = None
         self.current_log_filename = None
         self.log_start_btn.setEnabled(True)
         self.log_stop_btn.setEnabled(False)
-        self.status_bus.setText("Logging Stopped")
 
     def write_trc_header(self):
+        # Prevent writing header multiple times in the same log file
+        if self.header_written:
+            return
         dt_now = time.localtime()
         human_time = time.strftime("%d-%m-%Y %H:%M:%S", dt_now)
         millis = int((time.time() % 1) * 1000)
         epoch_days_fraction = time.time() / 86400  # fractional days since epoch
 
-        if self.log_file:
-            self.log_file.write(
+        if self.log_handler:
+            self.log_handler.write(
                 f";$FILEVERSION=1.1\n"
                 f";$STARTTIME={epoch_days_fraction:.10f}\n"
                 f";\n"
@@ -720,15 +757,28 @@ class PCANViewClone(QMainWindow):
         direction = "Tx" if tx else "Rx"
         data_str = " ".join(f"{b:02X}" for b in msg.DATA[:msg.LEN])
         offset_ms = offset_sec * 1000  # convert sec → ms
-        if self.log_file:
-            self.log_file.write(
+        if self.log_handler:
+            self.log_handler.write(
                 f"{msg_num:6}){offset_ms:11.1f}  {direction:<3}        "
                 f"{msg.ID:04X}  {msg.LEN}  {data_str}\n"
             )
 
+    # ----------------------------
+    # Blinking status_bus text when logging active
+    # ----------------------------
+    def _blink_status_text(self):
+        if self.logging:
+            if self._blink_state:
+                self.status_bus.setStyleSheet("color: red; font-weight: bold;")
+            else:
+                self.status_bus.setStyleSheet("color: black; font-weight: normal;")
+            self._blink_state = not self._blink_state
+        else:
+            self.status_bus.setStyleSheet("color: black; font-weight: normal;")
+            self._blink_timer.stop()
 
 if __name__ == "__main__":
-    LOCAL_VERSION = "1.0.2"  # keep in sync with your app version
+    LOCAL_VERSION = "1.0.3"  # keep in sync with your app version
     app = QApplication(sys.argv)  # Create QApplication first
     updater.check_for_update(LOCAL_VERSION, app)  # Pass app instance here
     window = PCANViewClone()
